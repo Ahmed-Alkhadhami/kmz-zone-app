@@ -166,14 +166,28 @@ def parse_kmz_or_kml(uploaded_file):
 def load_polygons_from_excel(uploaded_excel):
     """تحميل زونات من Excel"""
     df = pd.read_excel(uploaded_excel)
+    
+    # التأكد من وجود العواميد الأساسية
+    required_cols = ["polygon_id", "square_number", "sign_number", "coordinates"]
+    for col in required_cols:
+        if col not in df.columns:
+            st.error(f"العامود {col} مفقود في ملف Excel")
+            return None, None
+    
+    # تحويل coordinates من JSON إلى list
     df["coordinates"] = df["coordinates"].apply(json.loads)
     df["polygon"] = df["coordinates"].apply(lambda c: Polygon(c))
     
-    # إضافة Area و Center إذا لم تكن موجودة
-    if "Area" not in df.columns:
+    # حساب Area إذا كانت فارغة أو غير موجودة
+    if "Area" not in df.columns or df["Area"].isna().any():
         df["Area"] = df["polygon"].apply(calculate_area_in_sqm)
-    if "Center" not in df.columns:
+    
+    # حساب Center إذا كانت فارغة أو غير موجودة
+    if "Center" not in df.columns or df["Center"].isna().any():
         df["Center"] = df["polygon"].apply(lambda p: (p.centroid.x, p.centroid.y))
+    else:
+        # تحويل Center من string إلى tuple إذا كانت موجودة
+        df["Center"] = df["Center"].apply(lambda c: json.loads(c) if isinstance(c, str) else c)
     
     spatial_index = STRtree(df["polygon"].tolist())
     return df, spatial_index
@@ -229,15 +243,15 @@ def find_nearest_zone(point, df):
         if dist < min_dist:
             min_dist = dist
             nearest_zone = {
+                "distance_meters": round(dist, 2),
                 "polygon_id": int(row["polygon_id"]),
                 "square_number": row["square_number"],
-                "sign_number": row["sign_number"],
-                "distance_meters": round(dist, 2)
+                "sign_number": row["sign_number"]
             }
     
     return nearest_zone
 
-def export_kml(df, fill_alpha):
+def export_kml_z(df, fill_alpha):
     doc = Document()
 
     kml = doc.createElement("kml")
@@ -256,13 +270,13 @@ def export_kml(df, fill_alpha):
         placemark.appendChild(name)
 
         # ===== الوصف =====
-        desc = doc.createElement("description")
-        desc.appendChild(
-            doc.createTextNode(
-                f"Square: {row['square_number']} | Sign: {row['sign_number']} | Area: {row['Area']:.2f} m²"
-            )
-        )
-        placemark.appendChild(desc)
+        # desc = doc.createElement("description")
+        # desc.appendChild(
+        #     doc.createTextNode(
+        #         f"Square: {row['square_number']} | Sign: {row['sign_number']} | Area: {row['Area']:.2f} m²"
+        #     )
+        # )
+        # placemark.appendChild(desc)
 
         # ===== ExtendedData =====
         extended_data = doc.createElement("ExtendedData")
@@ -323,6 +337,138 @@ def export_kml(df, fill_alpha):
 
     return doc.toprettyxml(indent="  ")
 
+def export_points_to_kml(df_points):
+    """تصدير النقاط إلى ملف KML"""
+    kml = []
+    kml.append('<?xml version="1.0" encoding="UTF-8"?>')
+    kml.append('<kml xmlns="http://www.opengis.net/kml/2.2">')
+    kml.append('<Document>')
+    kml.append('  <name>Test Points Results</name>')
+    kml.append('  <description>Points tested against zones</description>')
+    
+    # Styles حسب CMP_Result
+    # Style للنقاط الصحيحة (CMP_Result = 1)
+    kml.append('  <Style id="greenPin">')
+    kml.append('    <IconStyle>')
+    kml.append('      <color>ff00ff00</color>')
+    kml.append('      <scale>1.2</scale>')
+    kml.append('      <Icon>')
+    kml.append('        <href>http://maps.google.com/mapfiles/kml/paddle/grn-circle.png</href>')
+    kml.append('      </Icon>')
+    kml.append('    </IconStyle>')
+    kml.append('  </Style>')
+    
+    # Style للنقاط الخاطئة جزئياً (CMP_Result = 2)
+    kml.append('  <Style id="yellowPin">')
+    kml.append('    <IconStyle>')
+    kml.append('      <color>ff00ffff</color>')
+    kml.append('      <scale>1.2</scale>')
+    kml.append('      <Icon>')
+    kml.append('        <href>http://maps.google.com/mapfiles/kml/paddle/ylw-circle.png</href>')
+    kml.append('      </Icon>')
+    kml.append('    </IconStyle>')
+    kml.append('  </Style>')
+    
+    # Style للنقاط الخاطئة (CMP_Result = 3)
+    kml.append('  <Style id="orangePin">')
+    kml.append('    <IconStyle>')
+    kml.append('      <color>ff0080ff</color>')
+    kml.append('      <scale>1.2</scale>')
+    kml.append('      <Icon>')
+    kml.append('        <href>http://maps.google.com/mapfiles/kml/paddle/orange-circle.png</href>')
+    kml.append('      </Icon>')
+    kml.append('    </IconStyle>')
+    kml.append('  </Style>')
+    
+    # Style للنقاط خارج الزونات (CMP_Result = 4)
+    kml.append('  <Style id="redPin">')
+    kml.append('    <IconStyle>')
+    kml.append('      <color>ff0000ff</color>')
+    kml.append('      <scale>1.2</scale>')
+    kml.append('      <Icon>')
+    kml.append('        <href>http://maps.google.com/mapfiles/kml/paddle/red-circle.png</href>')
+    kml.append('      </Icon>')
+    kml.append('    </IconStyle>')
+    kml.append('  </Style>')
+    
+    # تجميع النقاط حسب CMP_Result
+    if 'CMP_Result' in df_points.columns:
+        result_groups = {
+            1: 'Correct Match (Sign)',
+            2: 'Partial Match (Square Only)',
+            3: 'No Match',
+            4: 'Outside All Zones'
+        }
+        
+        for result_num, result_name in result_groups.items():
+            df_group = df_points[df_points['CMP_Result'] == result_num]
+            
+            if len(df_group) > 0:
+                kml.append(f'  <Folder><name>{result_name} ({len(df_group)} points)</name>')
+                
+                for _, row in df_group.iterrows():
+                    point_id = row.get('id', 'Unknown')
+                    lat = row['lat']
+                    lon = row['lon']
+                    location_type = row.get('location_type', '')
+                    square_number = row.get('square_number', '')
+                    sign_number = row.get('sign_number', '')
+                    polygons_count = row.get('polygons_count', 0)
+                    
+                    # تحديد اللون حسب CMP_Result
+                    style_map = {1: 'greenPin', 2: 'yellowPin', 3: 'orangePin', 4: 'redPin'}
+                    style = style_map.get(result_num, 'redPin')
+                    
+                    # إنشاء الوصف
+                    desc_parts = [
+                        f"ID: {point_id}",
+                        f"Location Type: {location_type}",
+                        f"Square: {square_number}",
+                        f"Sign: {sign_number}",
+                        f"Zones Count: {polygons_count}",
+                        f"CMP Result: {result_num}"
+                    ]
+                    
+                    if 'CMP_square' in row and row['CMP_square']:
+                        desc_parts.append(f"CMP Square: {row['CMP_square']}")
+                    if 'CMP_sign' in row and row['CMP_sign']:
+                        desc_parts.append(f"CMP Sign: {row['CMP_sign']}")
+                    
+                    desc = "<br>".join(desc_parts)
+                    
+                    kml.append('      <Placemark>')
+                    kml.append(f'        <name>Point {point_id}</name>')
+                    kml.append(f'        <description><![CDATA[{desc}]]></description>')
+                    kml.append(f'        <styleUrl>#{style}</styleUrl>')
+                    kml.append('        <Point>')
+                    kml.append(f'          <coordinates>{lon},{lat},0</coordinates>')
+                    kml.append('        </Point>')
+                    kml.append('      </Placemark>')
+                
+                kml.append('  </Folder>')
+    else:
+        # إذا لم يكن هناك CMP_Result، نصدر كل النقاط بدون تصنيف
+        kml.append('  <Folder><name>All Points</name>')
+        
+        for _, row in df_points.iterrows():
+            point_id = row.get('id', 'Unknown')
+            lat = row['lat']
+            lon = row['lon']
+            
+            kml.append('      <Placemark>')
+            kml.append(f'        <name>Point {point_id}</name>')
+            kml.append('        <Point>')
+            kml.append(f'          <coordinates>{lon},{lat},0</coordinates>')
+            kml.append('        </Point>')
+            kml.append('      </Placemark>')
+        
+        kml.append('  </Folder>')
+    
+    kml.append('</Document>')
+    kml.append('</kml>')
+    
+    return "\n".join(kml)
+
 # ======================================================
 # الواجهة – اختيار مصدر الزونات
 # ======================================================
@@ -343,15 +489,32 @@ spatial_index = None
 if source == "Excel":
     st.info("📄 قالب اكسل المطلوب:")
     st.code("""
-polygon_id | square_number | sign_number | coordinates
-1          | 29A           | 2/204       | [[lon,lat],[lon,lat],...]
+polygon_id | square_number | sign_number | coordinates | Area | Center
+1          | 29A           | 2/204       | [[lon,lat],[lon,lat],...] | (optional) | (optional)
 """)
 
     uploaded_excel = st.file_uploader("📂 ارفع ملف Excel للزونات", type=["xlsx"])
     if uploaded_excel:
         df_polygons, spatial_index = load_polygons_from_excel(uploaded_excel)
-        st.success(f"تم تحميل {len(df_polygons)} زون")
-
+        
+        if df_polygons is not None:
+            st.success(f"تم تحميل {len(df_polygons)} زون")
+            
+            # تصدير Excel بعد إضافة Area و Center
+            export_df = df_polygons.drop(columns=["polygon"]).copy()
+            export_df["coordinates"] = export_df["coordinates"].apply(json.dumps)
+            export_df["Center"] = export_df["Center"].apply(json.dumps)
+            
+            buffer = io.BytesIO()
+            export_df.to_excel(buffer, index=False)
+            buffer.seek(0)
+            
+            st.download_button(
+                "📥 تحميل الزونات المحدّثة كـ Excel",
+                data=buffer,
+                file_name="polygons_updated.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
 # ======================================================
 # خيار KMZ / KML
@@ -385,7 +548,7 @@ if source == "KMZ / KML":
 # باقي الخطوات (مشتركة)
 # ======================================================
 if df_polygons is not None:
-
+    st.divider()
     st.subheader("📍 اختبار نقطة واحدة")
     coord_text = st.text_input("أدخل الإحداثيات كالتالي: (lat, lon). Ex: 21.41855, 39.88040")
 
@@ -394,10 +557,12 @@ if df_polygons is not None:
         point = Point(lon, lat)
         st.json(find_point(point, df_polygons, spatial_index))
         
-        
+    st.divider() 
     st.subheader("📊 اختبار ملف نقاط Excel")
     excel_points = st.file_uploader("ارفع ملف Excel (location_type, id, lat, lon, square_number, sign_number)", type=["xlsx"])
 
+    out_df = None  # إضافة هذا السطر في البداية
+    
     if excel_points:
         points_df = pd.read_excel(excel_points)
         
@@ -447,7 +612,8 @@ if df_polygons is not None:
             file_name="points_result.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
+    
+    st.divider()
     st.subheader("🔍 إيجاد أقرب زون للنقاط (3 و 4)")
     st.info("هذا القسم يعمل على ملف النتائج السابق ويجد أقرب زون للنقاط ذات CMP_Result = 3 أو 4")
     
@@ -472,14 +638,31 @@ if df_polygons is not None:
                     if r["CMP_Result"] in [3, 4]:
                         p = Point(r["lon"], r["lat"])
                         nearest = find_nearest_zone(p, df_polygons)
-                        result_row["nearest_zone"] = json.dumps(nearest, ensure_ascii=False) if nearest else ""
+                        if nearest:
+                            result_row["nearest_distance_m"] = nearest["distance_meters"]
+                            result_row["nearest_zone"] = json.dumps(nearest, ensure_ascii=False)
+                        else:
+                            result_row["nearest_distance_m"] = ""
+                            result_row["nearest_zone"] = ""
                     else:
+                        result_row["nearest_distance_m"] = ""
                         result_row["nearest_zone"] = ""
                     
                     updated_results.append(result_row)
                     progress_bar.progress((idx + 1) / total)
                 
                 final_df = pd.DataFrame(updated_results)
+                
+                # ترتيب العواميد: نضع nearest_distance_m قبل nearest_zone
+                cols = list(final_df.columns)
+                if "nearest_zone" in cols and "nearest_distance_m" in cols:
+                    # إزالة العمودين من مكانهما
+                    cols.remove("nearest_distance_m")
+                    cols.remove("nearest_zone")
+                    # إضافتهما في النهاية بالترتيب الصحيح
+                    cols.extend(["nearest_distance_m", "nearest_zone"])
+                    final_df = final_df[cols]
+                
                 st.success(f"تم معالجة {len(final_df)} نقطة")
                 st.dataframe(final_df)
                 
@@ -493,283 +676,50 @@ if df_polygons is not None:
                     file_name="points_with_nearest_zone.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
-
+            
+    st.divider()
     st.subheader("🧩 تصدير KML")
-    alpha = st.slider("شفافية داخل الزون", 0, 255, 85)
-
-    if st.button("تحميل KML"):
-        st.download_button(
-            "تحميل zones.kml",
-            export_kml(df_polygons, f"{alpha:02x}"),
-            file_name="zones.kml"
-        )
-
-
-# =============================================================================
-# import io
-# import streamlit as st
-# import zipfile
-# import xml.etree.ElementTree as ET
-# import pandas as pd
-# import json
-# import random
-# from shapely.geometry import Polygon, Point
-# from shapely.strtree import STRtree
-# from bs4 import BeautifulSoup
-# from datetime import datetime
-# from xml.dom.minidom import Document
-# 
-# # =========================
-# # إعداد الصفحة
-# # =========================
-# st.set_page_config(
-#     page_title="أداة فحص الزونات (KMZ)",
-#     layout="wide"
-# )
-# 
-# st.title("🗺️ أداة استخراج وفحص الزونات (KMZ)")
-# 
-# # =========================
-# # دوال مساعدة
-# # =========================
-# 
-# def random_kml_color(fill_alpha="55", line_alpha="FF"):
-#     r = random.randint(0, 255)
-#     g = random.randint(0, 255)
-#     b = random.randint(0, 255)
-#     return (
-#         f"{fill_alpha}{b:02x}{g:02x}{r:02x}",
-#         f"{line_alpha}{b:02x}{g:02x}{r:02x}"
-#     )
-# 
-# 
-# def parse_kmz(uploaded_file):
-#     with zipfile.ZipFile(uploaded_file, "r") as kmz:
-#         kml_name = [f for f in kmz.namelist() if f.endswith(".kml")][0]
-#         kml_data = kmz.read(kml_name)
-# 
-#     root = ET.fromstring(kml_data)
-#     ns = {"kml": "http://www.opengis.net/kml/2.2"}
-# 
-#     records = []
-#     counter = 1
-# 
-#     for placemark in root.findall(".//kml:Placemark", ns):
-#         desc = placemark.findtext("kml:description", "", ns)
-# 
-#         square = ""
-#         sign = ""
-# 
-#         if desc:
-#             soup = BeautifulSoup(desc, "html.parser")
-#             tds = [td.get_text(strip=True) for td in soup.find_all("td")]
-#             for i in range(len(tds)):
-#                 if tds[i] == "رقم المربع":
-#                     square = tds[i + 1]
-#                 if tds[i] == "رقم الشاخص":
-#                     sign = tds[i + 1]
-# 
-#         for poly in placemark.findall(".//kml:Polygon", ns):
-#             coords_text = poly.findtext(".//kml:coordinates", "", ns).strip()
-#             coords = []
-#             for c in coords_text.split():
-#                 lon, lat, *_ = c.split(",")
-#                 coords.append((float(lon), float(lat)))
-# 
-#             records.append({
-#                 "polygon_id": counter,
-#                 "square_number": square,
-#                 "sign_number": sign,
-#                 "polygon": Polygon(coords),
-#                 "coordinates": coords
-#             })
-#             counter += 1
-# 
-#     df = pd.DataFrame(records)
-#     tree = STRtree(df["polygon"].tolist())
-#     return df, tree
-# 
-# 
-# def find_point(point, df, tree):
-#     results = []
-# 
-#     candidate_indexes = tree.query(point)
-# 
-#     for idx in candidate_indexes:
-#         poly = df.iloc[idx]["polygon"]
-# 
-#         if poly.covers(point):
-#             row = df.iloc[idx]
-#             results.append({
-#                 "polygon_id": int(row["polygon_id"]),
-#                 "square_number": row["square_number"],
-#                 "sign_number": row["sign_number"]
-#             })
-# 
-#     return results
-# 
-# 
-# 
-# def export_kml(df, fill_alpha):
-#     doc = Document()
-#     kml = doc.createElement("kml")
-#     kml.setAttribute("xmlns", "http://www.opengis.net/kml/2.2")
-#     doc.appendChild(kml)
-# 
-#     document = doc.createElement("Document")
-#     kml.appendChild(document)
-# 
-#     for _, row in df.iterrows():
-#         placemark = doc.createElement("Placemark")
-# 
-#         name = doc.createElement("name")
-#         name.appendChild(doc.createTextNode(f"Polygon {row['polygon_id']}"))
-#         placemark.appendChild(name)
-# 
-#         fill, line = random_kml_color(fill_alpha, "FF")
-# 
-#         style = doc.createElement("Style")
-# 
-#         ls = doc.createElement("LineStyle")
-#         lc = doc.createElement("color")
-#         lc.appendChild(doc.createTextNode(line))
-#         lw = doc.createElement("width")
-#         lw.appendChild(doc.createTextNode("2"))
-#         ls.appendChild(lc)
-#         ls.appendChild(lw)
-# 
-#         ps = doc.createElement("PolyStyle")
-#         pc = doc.createElement("color")
-#         pc.appendChild(doc.createTextNode(fill))
-#         ps.appendChild(pc)
-# 
-#         style.appendChild(ls)
-#         style.appendChild(ps)
-#         placemark.appendChild(style)
-# 
-#         polygon = doc.createElement("Polygon")
-#         outer = doc.createElement("outerBoundaryIs")
-#         ring = doc.createElement("LinearRing")
-#         coords = doc.createElement("coordinates")
-# 
-#         coord_text = " ".join(
-#             f"{lon},{lat},0" for lon, lat in row["polygon"].exterior.coords
-#         )
-# 
-#         coords.appendChild(doc.createTextNode(coord_text))
-#         ring.appendChild(coords)
-#         outer.appendChild(ring)
-#         polygon.appendChild(outer)
-#         placemark.appendChild(polygon)
-# 
-#         document.appendChild(placemark)
-# 
-#     return doc.toprettyxml()
-# 
-# def load_polygons_from_excel(uploaded_excel):
-#     df = pd.read_excel(uploaded_excel)
-#     df["coordinates"] = df["coordinates"].apply(json.loads)
-#     df["polygon"] = df["coordinates"].apply(lambda c: Polygon(c))
-#     spatial_index = STRtree(df["polygon"].tolist())
-#     return df, spatial_index
-# 
-# 
-# # =========================
-# # الواجهة
-# # =========================
-# 
-# source = st.radio(
-#     "اختر مصدر الزونات",
-#     ["KMZ / KML", "Excel"]
-# )
-# 
-# if source == "Excel":
-#     uploaded_excel = st.file_uploader("📂 ارفع ملف Excel للزونات", type=["xlsx"])
-#     if uploaded_excel:
-#         df_polygons, spatial_index = load_polygons_from_excel(uploaded_excel)
-# 
-# 
-# uploaded_kmz = st.file_uploader("📂 ارفع ملف KMZ", type=["kmz"])
-# 
-# 
-# if source == "KMZ / KML":
-#     if uploaded_kmz:
-#         df_polygons, spatial_index = parse_kmz(uploaded_kmz)
-#         st.success(f"تم تحميل {len(df_polygons)} زون")
-#         export_df = df_polygons.copy()
-#         export_df["coordinates"] = export_df["coordinates"].apply(json.dumps)
-#         export_df.drop(columns=["polygon"], inplace=True)
-#     
-#             # ===== تصدير Excel (زر تحميل) =====
-#         excel_buffer = io.BytesIO()
-#         export_df.to_excel(excel_buffer, index=False)
-#         excel_buffer.seek(0)
-#         
-#         st.download_button(
-#             label="📥 تحميل بيانات الزونات (Excel)",
-#             data=excel_buffer,
-#             file_name="polygons.xlsx",
-#             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-#         )
-# 
-#     
-#     
-#     st.subheader("📍 اختبار نقطة واحدة")
-# 
-#     coord_text = st.text_input("أدخل الإحداثيات كالتالي: (lat, lon). Ex: 21.41855, 39.88040")
-#     
-#     if st.button("اختبار النقطة"):
-#         try:
-#             lat, lon = map(float, coord_text.split(","))
-#             point = Point(lon, lat)
-#             matches = find_point(point, df_polygons, spatial_index)
-#             st.write(f"عدد الزونات: {len(matches)}")     
-#             st.json(matches)
-#         except Exception:
-#             st.error("صيغة الإحداثيات غير صحيحة. استخدم: lat, lon")
-# 
-#     st.subheader("📊 اختبار ملف Excel")
-#     excel_file = st.file_uploader("ارفع ملف Excel (id, lat, lon)", type=["xlsx"])
-# 
-#     if excel_file:
-#         points_df = pd.read_excel(excel_file)
-#         results = []
-# 
-#         for _, r in points_df.iterrows():
-#             p = Point(r["lon"], r["lat"])
-#             matches = find_point(p, df_polygons, spatial_index)
-#             results.append({
-#                 "id": r["id"],
-#                 "lat": r["lat"],
-#                 "lon": r["lon"],
-#                 "عدد_الزونات": len(matches),
-#                 "النتيجة": json.dumps(matches, ensure_ascii=False)
-#             })
-# 
-#         out_df = pd.DataFrame(results)
-#         st.dataframe(out_df)
-# 
-#         excel_buffer = io.BytesIO()
-#         out_df.to_excel(excel_buffer, index=False)
-#         excel_buffer.seek(0)
-#         
-#         st.download_button(
-#             label="📥 تحميل نتيجة اختبار النقاط (Excel)",
-#             data=excel_buffer,
-#             file_name="Result_points.xlsx",
-#             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-#         )
-# 
-# 
-#     st.subheader("🧩 تصدير KML")
-#     alpha = st.slider("شفافية داخل الزون", 0, 255, 85)
-# 
-#     if st.button("تحميل KML"):
-#         kml_data = export_kml(df_polygons, f"{alpha:02x}")
-#         st.download_button(
-#             "تحميل zones.kml",
-#             kml_data,
-#             file_name="zones.kml"
-#         )
-# 
-# =============================================================================
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### 📐 تصدير الزونات")
+        alpha = st.slider("شفافية داخل الزون", 0, 255, 85)
+        
+        if st.button("توليد KML للزونات"):
+            kml_zones = export_kml_z(df_polygons, f"{alpha:02x}")
+            st.download_button(
+                "📥 تحميل zones.kml",
+                data=kml_zones,
+                file_name="zones.kml",
+                mime="application/vnd.google-earth.kml+xml",
+                key="download_zones_kml"
+            )
+    
+    with col2:
+        st.markdown("#### 📍 تصدير النقاط")
+        # التحقق من وجود بيانات نقاط تم اختبارها
+        if out_df is not None and not out_df.empty:
+            st.info(f"يوجد {len(out_df)} نقطة جاهزة للتصدير")
+            
+            if st.button("توليد KML للنقاط"):
+                kml_points = export_points_to_kml(out_df)
+                st.download_button(
+                    "📥 تحميل test_points.kml",
+                    data=kml_points,
+                    file_name="test_points.kml",
+                    mime="application/vnd.google-earth.kml+xml",
+                    key="download_points_kml"
+                )
+        else:
+            st.warning("⚠️ لا توجد نقاط جاهزة للتصدير بعد")
+            
+            if st.button("توليد KML للنقاط"):
+                kml_points = export_points_to_kml(out_df)
+                st.download_button(
+                    "📥 تحميل test_points.kml",
+                    data=kml_points,
+                    file_name="test_points.kml",
+                    mime="application/vnd.google-earth.kml+xml",
+                    key="download_points_kml"
+                )
